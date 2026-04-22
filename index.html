@@ -1263,15 +1263,15 @@ async function sendSignatureEnvelope(){
     return;
   }
 
-  // Get JWT token from Netlify function
-  let token = await dsGetToken();
+  // Get JWT token via Netlify function
+  const token = await dsGetToken();
   if(!token){
     sendBtn.textContent = 'Start Signing';
     sendBtn.disabled = false;
     return;
   }
 
-  console.log('Got token, creating envelope...');
+  sendBtn.textContent = 'Creating envelope...';
 
   sendBtn.textContent = 'Creating envelope...';
   sendBtn.disabled = true;
@@ -1312,25 +1312,21 @@ async function sendSignatureEnvelope(){
       }]
     }));
 
-    const envResponse = await fetch(
-      `${DS_CONFIG.baseUrl}/v2.1/accounts/${DS_CONFIG.accountId}/envelopes`,
-      {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          status: 'sent',
-          emailSubject: `Medicaid Signature Package — ${r.name}`,
-          emailBlurb: `Medicaid intake signature documents for ${r.name}, prepared by ${DS_CONFIG.facilityName}.`,
-          compositeTemplates,
-        }),
+    // Create envelope via Netlify proxy (avoids CORS)
+    const envData = await dsAPI('createEnvelope', {
+      envelope: {
+        status: 'sent',
+        emailSubject: `Medicaid Signature Package — ${r.name}`,
+        emailBlurb: `Medicaid intake signature documents for ${r.name}, prepared by ${DS_CONFIG.facilityName}.`,
+        compositeTemplates,
       }
-    );
+    });
 
-    const envData = await envResponse.json();
     if(!envData.envelopeId) throw new Error(envData.message || envData.errorCode || 'No envelope ID returned');
 
     const envelopeId = envData.envelopeId;
     r.envelopeId = envelopeId;
+    console.log('Envelope created:', envelopeId);
 
     // Open embedded signing for in-person signers
     const inPersonSigners = allRecipients.filter(rec => rec.method === 'inperson');
@@ -1339,27 +1335,25 @@ async function sendSignatureEnvelope(){
     closeSigningModal();
 
     for(const signer of inPersonSigners){
-      const viewResponse = await fetch(
-        `${DS_CONFIG.baseUrl}/v2.1/accounts/${DS_CONFIG.accountId}/envelopes/${envelopeId}/views/recipient`,
-        {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            returnUrl:            DS_CONFIG.redirectUri + `?signed=${envelopeId}`,
-            authenticationMethod: 'none',
-            email:                `embedded-${signer.role.toLowerCase().replace(/\s/g,'')}@careintake.local`,
-            userName:             signer.name,
-            clientUserId:         `${r.id}-${signer.role}`,
-            recipientId:          String(allRecipients.findIndex(a=>a.role===signer.role)+1),
-          })
+      // Get signing URL via Netlify proxy
+      const viewData = await dsAPI('recipientView', {
+        envelopeId,
+        viewRequest: {
+          returnUrl:            DS_CONFIG.redirectUri + `?signed=${envelopeId}`,
+          authenticationMethod: 'none',
+          email:                `embedded-${signer.role.toLowerCase().replace(/\s/g,'')}@careintake.local`,
+          userName:             signer.name,
+          clientUserId:         `${r.id}-${signer.role}`,
+          recipientId:          String(allRecipients.findIndex(a=>a.role===signer.role)+1),
         }
-      );
-      const viewData = await viewResponse.json();
+      });
+
       if(viewData.url){
         window.open(viewData.url, '_blank');
         showToast(`Signing opened for ${signer.name} — new tab`);
       } else {
         showToast(`Could not get signing URL: ${viewData.message||'unknown error'}`);
+        console.error('Recipient view error:', viewData);
       }
     }
 
@@ -1386,10 +1380,7 @@ async function sendSignatureEnvelope(){
 // This is DocuSign's recommended flow for single-page browser apps
 
 // ── AUTH: JWT via Netlify function ──
-// No OAuth redirects needed — the function handles everything server-side
-
 async function dsGetToken(){
-  // Use cached token if still valid
   const stored = sessionStorage.getItem('ds_access_token');
   const expiry  = parseInt(sessionStorage.getItem('ds_token_expiry') || '0');
   if(stored && Date.now() < expiry){
@@ -1402,16 +1393,9 @@ async function dsGetToken(){
     const resp = await fetch('/.netlify/functions/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
+      body: JSON.stringify({ action: 'token' }),
     });
     const data = await resp.json();
-
-    if(data.error === 'consent_required'){
-      // One-time consent needed — open in new tab
-      window.open(data.consent_url, '_blank');
-      showToast('Please authorize in the new tab, then click Start Signing again');
-      return null;
-    }
 
     if(data.access_token){
       dsAccessToken = data.access_token;
@@ -1421,18 +1405,26 @@ async function dsGetToken(){
       return dsAccessToken;
     }
 
-    console.error('JWT token error:', data);
-    showToast(`DocuSign auth error: ${data.error || 'unknown'}`);
+    console.error('Token error:', data);
+    showToast(`Auth error: ${data.error || 'unknown'}`);
     return null;
-
   } catch(e){
     console.error('Token fetch failed:', e);
-    showToast('Could not connect to DocuSign — check function logs');
+    showToast('Could not connect to DocuSign');
     return null;
   }
 }
 
-// Not needed anymore with JWT but kept so no references break
+// Proxy all DocuSign API calls through Netlify function to avoid CORS
+async function dsAPI(action, payload){
+  const resp = await fetch('/.netlify/functions/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action, ...payload }),
+  });
+  return await resp.json();
+}
+
 async function dsAuthorize(){ await dsGetToken(); }
 
 // ── PRE-FILL TABS ──
