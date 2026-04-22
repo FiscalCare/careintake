@@ -2,7 +2,6 @@ const https = require('https');
 const crypto = require('crypto');
 
 exports.handler = async (event) => {
-  // Handle CORS preflight
   if(event.httpMethod === 'OPTIONS'){
     return { statusCode: 200, headers: corsHeaders(), body: '' };
   }
@@ -12,39 +11,78 @@ exports.handler = async (event) => {
 
   const INTEGRATION_KEY = 'fa2466a9-cb58-4909-8db8-4be8b67abd1f';
   const USER_ID         = process.env.DOCUSIGN_USER_ID;
-  const PRIVATE_KEY     = process.env.DOCUSIGN_PRIVATE_KEY;
+  const PRIVATE_KEY_RAW = process.env.DOCUSIGN_PRIVATE_KEY;
   const OAUTH_BASE      = 'account-d.docusign.com';
 
-  if(!USER_ID || !PRIVATE_KEY){
+  if(!USER_ID || !PRIVATE_KEY_RAW){
     return {
       statusCode: 500,
       headers: corsHeaders(),
-      body: JSON.stringify({ error: 'Missing DOCUSIGN_USER_ID or DOCUSIGN_PRIVATE_KEY env vars' }),
+      body: JSON.stringify({ error: 'Missing DOCUSIGN_USER_ID or DOCUSIGN_PRIVATE_KEY' }),
     };
   }
 
   try{
-    const now    = Math.floor(Date.now() / 1000);
-    const header  = b64url(JSON.stringify({ alg:'RS256', typ:'JWT' }));
+    // Clean up the private key - handle all possible newline formats
+    let cleanKey = PRIVATE_KEY_RAW
+      .replace(/\\n/g, '\n')   // escaped newlines
+      .replace(/\r\n/g, '\n')  // windows newlines
+      .replace(/\r/g, '\n')    // old mac newlines
+      .trim();
+
+    // If the key doesn't have proper newlines, reconstruct it
+    if(!cleanKey.includes('\n')){
+      // Key is all on one line - split it properly
+      cleanKey = cleanKey
+        .replace('-----BEGIN RSA PRIVATE KEY-----', '-----BEGIN RSA PRIVATE KEY-----\n')
+        .replace('-----END RSA PRIVATE KEY-----', '\n-----END RSA PRIVATE KEY-----')
+        // Split the base64 content into 64-char lines
+        .split('\n')
+        .map((line, i) => {
+          if(line.startsWith('-----')) return line;
+          // Split long base64 into 64-char chunks
+          const chunks = [];
+          for(let j = 0; j < line.length; j += 64){
+            chunks.push(line.slice(j, j + 64));
+          }
+          return chunks.join('\n');
+        })
+        .join('\n');
+    }
+
+    console.log('Key starts with:', cleanKey.substring(0, 40));
+    console.log('Key has newlines:', cleanKey.includes('\n'));
+
+    // Build JWT
+    const now     = Math.floor(Date.now() / 1000);
+    const header  = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
     const payload = b64url(JSON.stringify({
       iss: INTEGRATION_KEY, sub: USER_ID, aud: OAUTH_BASE,
       iat: now, exp: now + 3600, scope: 'signature',
     }));
     const sigInput = `${header}.${payload}`;
 
-    const cleanKey = PRIVATE_KEY.replace(/\\n/g,'\n').replace(/\r/g,'').trim();
-    const sign = crypto.createSign('SHA256');
+    // Try signing with the key
+    const sign = crypto.createSign('RSA-SHA256');
     sign.update(sigInput);
-    const signature = sign.sign(cleanKey,'base64')
-      .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+    sign.end();
+    const signature = sign.sign({
+      key: cleanKey,
+      format: 'pem',
+    }, 'base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
 
     const jwt = `${sigInput}.${signature}`;
 
-    const tokenResp = await postReq(OAUTH_BASE, '/oauth/token',
-      `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`
-    );
+    // Exchange JWT for access token
+    const body = `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`;
+    const tokenResp = await postReq(OAUTH_BASE, '/oauth/token', body);
 
-    // If consent_required error, return helpful message
+    console.log('Token response status:', tokenResp.status);
+    console.log('Token response:', JSON.stringify(tokenResp.data).substring(0, 100));
+
     if(tokenResp.data && tokenResp.data.error === 'consent_required'){
       return {
         statusCode: 400,
@@ -64,17 +102,18 @@ exports.handler = async (event) => {
 
   } catch(err){
     console.error('JWT error:', err.message);
+    console.error('JWT error stack:', err.stack);
     return {
       statusCode: 500,
       headers: corsHeaders(),
-      body: JSON.stringify({ error: err.message }),
+      body: JSON.stringify({ error: err.message, stack: err.stack }),
     };
   }
 };
 
 function b64url(str){
   return Buffer.from(str).toString('base64')
-    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 function corsHeaders(){
@@ -91,7 +130,7 @@ function postReq(host, path, body){
     const req = https.request({
       hostname: host, path, method: 'POST',
       headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Type':   'application/x-www-form-urlencoded',
         'Content-Length': Buffer.byteLength(body),
       },
     }, res => {
