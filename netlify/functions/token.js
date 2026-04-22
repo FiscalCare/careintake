@@ -51,7 +51,7 @@ exports.handler = async (event) => {
         headers: corsHeaders(),
         body: JSON.stringify({
           error: 'consent_required',
-          consent_url: `https://account-d.docusign.com/oauth/auth?response_type=code&scope=signature%20impersonation&client_id=${INTEGRATION_KEY}&redirect_uri=https://musical-begonia-27b654.netlify.app/`
+          consent_url: `https://account-d.docusign.com/oauth/auth?response_type=code&scope=signature%20impersonation&client_id=${INTEGRATION_KEY}&redirect_uri=https://singular-shortbread-980c33.netlify.app/`
         }),
       };
     }
