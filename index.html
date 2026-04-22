@@ -939,8 +939,10 @@ function getSignaturePackage(r){
     recipients: buildCoreRecipients(r, isMarried),
   });
 
-  // 2. Submission on behalf — if rep or BOM is signing
-  if(r.signer === 'representative' || r.signer === 'bom'){
+  // 2. Submission on behalf — only if rep is actually signing
+  // dsState.primaryType reflects what the BOM selected in the modal
+  const repIsSigning = dsState.primaryType === 'rep';
+  if(repIsSigning){
     pkg.push({
       id: DS_CONFIG.templates.submissionBehalf,
       name: 'Submission on Behalf',
@@ -956,15 +958,25 @@ function getSignaturePackage(r){
 
   // 4. VA forms — if resident or spouse is a veteran
   if(r.veteran === 'yes' || r.spouseVeteran === 'yes'){
-    const vetName  = r.veteran === 'yes' ? r.name : (r.spouseName||'Spouse');
-    const vetEmail = r.veteran === 'yes' ? (r.residentEmail||'') : (r.spouseEmail||'');
+    // If resident is the veteran, use same signer as primary (resident or rep)
+    // If spouse is the veteran, use spouse
+    const vetIsResident = r.veteran === 'yes';
+    const vetName  = vetIsResident
+      ? (r.signer === 'representative' || r.signer === 'bom' ? (r.repName||'Representative') : r.name)
+      : (r.spouseName||'Spouse');
+    const vetRole  = vetIsResident
+      ? (r.signer === 'representative' || r.signer === 'bom' ? 'Representative' : 'Resident')
+      : 'Spouse';
+    const vetEmail = vetIsResident
+      ? (r.signer === 'representative' || r.signer === 'bom' ? (r.repEmail||'') : (r.residentEmail||''))
+      : (r.spouseEmail||'');
     pkg.push({
       id: DS_CONFIG.templates.vaForms,
       name: 'VA Authorization Form',
       tag: 'Veteran',
       tagCls: 'cond',
       desc: 'VA Form 21-0845 — Authorization to Disclose to Third Party',
-      recipients: [{ role:'Veteran-Signer', name: vetName, email: vetEmail }],
+      recipients: [{ role: vetRole, name: vetName, email: vetEmail }],
     });
   }
 
@@ -997,8 +1009,9 @@ function getSignaturePackage(r){
 
 function buildCoreRecipients(r, includeSpouse = false){
   const recipients = [];
-  if(r.signer === 'representative' || r.signer === 'bom'){
-    recipients.push({ role:'Representative', name: r.repName||'Representative', email: r.repEmail||'' });
+  // Use dsState.primaryType to determine who is actually signing right now
+  if(dsState.primaryType === 'rep'){
+    recipients.push({ role:'Representative', name: dsState.repName||r.repName||'Representative', email: r.repEmail||'' });
   } else {
     recipients.push({ role:'Resident', name: r.name, email: r.residentEmail||'' });
   }
@@ -1298,11 +1311,14 @@ async function sendSignatureEnvelope(){
           signers: p.recipients.map((rec, ri) => {
             const recFull = allRecipients.find(a => a.role === rec.role) || { method:'email', email:'', name: rec.name };
             const isInPerson = recFull.method === 'inperson';
+            const email = isInPerson
+              ? `embedded.${rec.role.toLowerCase().replace(/[^a-z0-9]/g,'')}@careintake.local`
+              : (recFull.email || `noreply.${rec.role.toLowerCase().replace(/[^a-z0-9]/g,'')}@careintake.local`);
             return {
               roleName:     rec.role,
               recipientId:  String(ri + 1),
               name:         recFull.name || rec.name,
-              email:        isInPerson ? `embedded-${rec.role.toLowerCase().replace(/\s/g,'')}@careintake.local` : recFull.email,
+              email,
               routingOrder: String(ri + 1),
               ...(isInPerson ? { clientUserId: `${r.id}-${rec.role}` } : {}),
               tabs: buildPrefillTabs(r, p.id),
